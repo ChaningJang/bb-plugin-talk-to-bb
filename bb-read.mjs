@@ -1,5 +1,6 @@
 // Created: 2026-09-15. A bounded, read-only BB CLI interface.
 import { execFile } from 'node:child_process';
+import { openSync, readSync, closeSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { capabilitySchemas, capabilityDefinitions, createCapabilities } from './bb-capabilities.mjs';
@@ -48,10 +49,31 @@ export function currentThreads(rows) {
       || b.updatedAt - a.updatedAt);
 }
 
+// The bb CLI is a JavaScript file that starts with `#!/usr/bin/env node`. A bb server
+// launched by launchd has PATH=/usr/bin:/bin:/usr/sbin:/sbin, so `env` finds no node and
+// every call fails with "env: node: No such file or directory". Run those with the node
+// already running this plugin; anything else (a native executable, a bare command name) is
+// run as-is.
+export function cliCommand(cliPath, args) {
+  return needsNode(cliPath) ? [process.execPath, [cliPath, ...args]] : [cliPath, args];
+}
+function needsNode(cliPath) {
+  if (/\.[cm]?js$/.test(cliPath)) return true;
+  if (!cliPath.includes('/')) return false; // resolved through PATH, nothing to inspect
+  let fd;
+  try {
+    fd = openSync(cliPath, 'r');
+    const buf = Buffer.alloc(128);
+    const head = buf.toString('utf8', 0, readSync(fd, buf, 0, 128, 0));
+    return /^#!\s*\S*\/env\s+(-S\s+)?node(\s|$)/.test(head.split('\n')[0]);
+  } catch { return false; } finally { if (fd !== undefined) closeSync(fd); }
+}
+
 /** @param {{cliPath:string,serverUrl:string,run?:Function,signal?:AbortSignal,timeout?:number}} options */
 export function createCli({ cliPath, serverUrl, run = exec, signal, timeout = 20000 }) {
   return async function cli(args, json = true) {
-    const { stdout } = await run(cliPath, args, {
+    const [file, fileArgs] = cliCommand(cliPath, args);
+    const { stdout } = await run(file, fileArgs, {
       shell: false, timeout, maxBuffer: 8 * 1024 * 1024, signal,
       env: { ...process.env, BB_CLI: cliPath, BB_SERVER_URL: serverUrl, BB_THREAD_ID: '', BB_PROJECT_ID: '', NO_COLOR: '1' },
     });
